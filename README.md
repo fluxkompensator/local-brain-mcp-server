@@ -23,27 +23,24 @@ Purpose: Top-level project overview, install + usage how-to,
  `------' `--' '--'  `--' `--'  `--'   `--'  `--'           `---'`-------' `--' `-'  `---'' `-' `---'' `-'`---'
 ```
 
-A local CLI + MCP server that turns web docs and GitHub repos into searchable vector knowledge bases ("brains") for Claude Code or any other MCP client. ~1150 LoC of Python. **Everything runs on your machine** — fetcher, embedding model, vector store, MCP server. No SaaS, no API keys (one optional GitHub token for high-volume crawls), no Docker, no GPU. One `bootstrap.sh` from a fresh clone to a working setup.
+Local CLI + MCP server for indexing docs into searchable knowledge bases ("brains") that Claude Code can query. Crawls web pages or GitHub repos, embeds with sentence-transformers, stores in ChromaDB, exposes the result over MCP. ~1150 lines of Python. Runs entirely on your machine. No SaaS, no Docker, no GPU.
 
 ## Contents
 
-- [Quickstart](#quickstart) — clone → bootstrap → first crawl
-- [What this does](#what-this-does) — 30-second technical summary of the pipeline
-- [Why local-first, with minimum effort](#why-local-first-with-minimum-effort)
-- [Install](#install) — [Prerequisites](#prerequisites) · [Env vars per shell](#setting-env-vars-shell-quirks)
-- [How to use it](#how-to-use-it) — static sites · SPA / GitHub source · coverage · resume · query
+- [Quickstart](#quickstart)
+- [What it does](#what-it-does)
+- [Install](#install)
+- [Usage](#usage)
 - [CLI reference](#cli-reference)
 - [MCP tools](#mcp-tools)
-- [Internals](#internals) — deep technical reference
-- [Limitations / non-goals](#limitations--non-goals)
+- [Internals](#internals)
+- [Limitations](#limitations)
 - [Repo layout](#repo-layout)
 - [License](#license)
 
----
-
 ## Quickstart
 
-Install system prereqs (pick your distro), then a one-shot bootstrap.
+System prereqs (pick your distro):
 
 <details>
 <summary><strong>Debian / Ubuntu / Mint / PopOS</strong></summary>
@@ -52,7 +49,7 @@ Install system prereqs (pick your distro), then a one-shot bootstrap.
 sudo apt update && sudo apt install -y git curl
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Optional — only if you'll use --browser mode (Chromium):
+# Optional, only if you'll use --browser mode (Chromium):
 sudo apt install -y libnss3 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
                     libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
                     libpango-1.0-0 libcairo2 libasound2 libgtk-3-0
@@ -66,14 +63,14 @@ sudo apt install -y libnss3 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
 sudo pacman -S --needed git curl
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Optional — only if you'll use --browser mode (Chromium):
+# Optional, only if you'll use --browser mode (Chromium):
 paru -S --needed nss atk at-spi2-atk libcups alsa-lib gtk3
 ```
 </details>
 
-Plus the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/setup) — only needed for MCP registration. Skip if you'll only drive the brain from the CLI.
+Plus the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/setup) for MCP registration (skip if you'll only drive the brain from the CLI).
 
-Then clone, bootstrap, and crawl:
+Clone and bootstrap:
 
 ```sh
 git clone https://github.com/<you>/claude-brain.git
@@ -81,191 +78,161 @@ cd claude-brain
 ./bootstrap.sh
 ```
 
-Activate the venv (one of these):
+Activate the venv:
 
 | Shell | Command |
 |---|---|
-| **fish** | `source .venv/bin/activate.fish` |
-| **bash** | `source .venv/bin/activate` |
-| **zsh** | `source .venv/bin/activate` |
+| fish | `source .venv/bin/activate.fish` |
+| bash | `source .venv/bin/activate` |
+| zsh  | `source .venv/bin/activate` |
 
-Register the MCP server and run your first crawl:
+Register the MCP server, then crawl your first brain:
 
 ```sh
 claude mcp add localbrain --scope user -- "$PWD/.venv/bin/python" "$PWD/server.py"
 python ingest.py https://docs.example.com/ --brain example-docs --depth 6 --max-pages 800
 ```
 
-Open a fresh Claude Code session and ask:
+In a fresh Claude Code session, ask it to search the `example-docs` brain. Claude calls the MCP tool, gets chunks with source URLs, answers grounded in your indexed docs.
 
-> *"Use search_knowledge against the example-docs brain to find how to configure X."*
-
-Done — Claude calls the MCP tool, gets chunks with source URLs, answers grounded in the docs you indexed.
-
-For env-var syntax (`LOCALBRAIN_ALLOW_PRIVATE`, `GITHUB_TOKEN`) per shell, see [Setting env vars](#setting-env-vars-shell-quirks). For everything else, read on.
-
----
-
-## What this does
+## What it does
 
 For each ingest:
 
-1. **Fetch.** Either parallel HTTP via `crawl4ai`'s `AsyncHTTPCrawlerStrategy` (default, ~150 ms/page), Chromium via `BrowserConfig` if you pass `--browser` (for JS-rendered sites), or raw markdown straight off `raw.githubusercontent.com` if you pass `--github-docs OWNER/REPO` (no HTML at all).
-2. **Strip chrome.** `crawl4ai`'s `DefaultMarkdownGenerator` with `PruningContentFilter(threshold=0.48, threshold_type="fixed")` runs a heuristic prune over the rendered DOM and emits `fit_markdown` — typically 1–10 KB of actual content from a 100+ KB nav-heavy doc page.
-3. **Chunk.** `langchain_text_splitters.RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)` splits on prose boundaries, falling back to characters.
-4. **Embed.** `sentence-transformers/all-MiniLM-L6-v2` (~80 MB model, 384-dim float vectors) on CPU via `chromadb.utils.embedding_functions.SentenceTransformerEmbeddingFunction`.
-5. **Persist.** ChromaDB `PersistentClient` writes a per-brain collection at `./chroma_db/`. Each chunk gets a deterministic ID `sha1(f"{url}#{idx}")` so re-crawls upsert cleanly. URL `_normalize` strips fragments so `/page#a` and `/page#b` dedupe.
-6. **Log.** Every URL attempt appends one JSON line to `crawl_log.<brain>.jsonl` with status `stored` / `failed` / `empty` and a timestamp. The manifest is what `--status`, `--retry-failed`, and `--coverage` read.
+1. **Fetch.** Parallel HTTP via `crawl4ai`'s `AsyncHTTPCrawlerStrategy` (default, ~150 ms/page), or Chromium with `--browser`, or raw markdown from `raw.githubusercontent.com` with `--github-docs OWNER/REPO`.
+2. **Strip chrome.** `DefaultMarkdownGenerator` + `PruningContentFilter(threshold=0.48)` emit `fit_markdown`. Typically 1–10 KB of content from a 100+ KB nav-heavy page.
+3. **Chunk.** `RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)`.
+4. **Embed.** `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~80 MB, CPU).
+5. **Persist.** ChromaDB `PersistentClient` at `./chroma_db/`. Chunk IDs are `sha1(f"{url}#{idx}")` so re-crawls upsert cleanly.
+6. **Log.** Each URL attempt appends one JSON line to `crawl_log.<brain>.jsonl` (`stored` / `failed` / `empty`). `--status`, `--retry-failed`, and `--coverage` read this.
 
-For each query (from Claude Code or any MCP client):
+For each query:
 
-- `search_knowledge(query, k, brain)` — embeds the query with the same model, runs ChromaDB cosine similarity, returns the top-k chunks with their `source` URL metadata.
-- `grep_brain(needle, brain, regex)` — pages through every chunk and runs Python `re` on the document text. Used when "does this exact identifier exist?" matters more than "what's similar?" Vector search returns near-matches even when the literal string is absent, which is enough for a model to confabulate an identifier; `grep_brain` gives a deterministic yes/no.
-- `learn_url`, `learn_site`, `learn_github_docs`, `list_brains` — same as the CLI, accessible to Claude as MCP tools.
+- `search_knowledge(query, k, brain)` runs ChromaDB cosine similarity, returns top-k chunks plus their source URLs.
+- `grep_brain(needle, brain, regex)` is a paged literal/regex scan. Vector search returns near-matches even when a literal isn't present, which is enough for a model to confabulate identifiers; grep gives a deterministic yes/no.
+- `learn_url`, `learn_site`, `learn_github_docs`, `list_brains` mirror the CLI as MCP tools.
 
-## Why local-first, with minimum effort
-
-**Local.** The vector store is one directory of SQLite + binary blobs. The embedding model runs on your CPU. The MCP server is a stdio process spawned by Claude Code. Nothing leaves your machine. Backup is `tar czf brain.tar.gz chroma_db/`. Move to another machine? `scp` the tarball.
-
-**Minimum effort.** One bootstrap script gets you from a fresh clone to a working setup; one `claude mcp add` registers the server; one CLI command per source you want indexed. Defaults are tuned for static documentation sites — most of the time you don't pass any flags beyond the URL and `--depth`. Re-runs are safe by default (skip-known short-circuits at the URL level), so killed crawls resume cleanly. `--coverage URL` measures completeness against the site's own `sitemap.xml`.
-
-**Boundary safety.** All URL-accepting entrypoints (`ingest`, `_fetch_sitemap_bytes`, the MCP `learn_*` tools) call `_check_url_safe` before any network I/O. It rejects non-`http(s)` schemes and any hostname that resolves to a private, loopback, or link-local address. Important when an MCP-exposed tool can be called by an LLM with arbitrary URLs from prompt-injected content. Bypass with `LOCALBRAIN_ALLOW_PRIVATE=1` for legitimate internal-docs crawls.
-
----
+All URL-accepting entrypoints call `_check_url_safe` first. It rejects non-http(s) schemes and any host that resolves to a private, loopback, or link-local IP. Bypass with `LOCALBRAIN_ALLOW_PRIVATE=1` for legitimate internal docs.
 
 ## Install
 
-Read this if you want the deeper rationale behind each prereq or you need shell-specific env-var syntax. The actual commands live in [Quickstart](#quickstart).
-
-Tested on Linux, Python 3.12. macOS should work. Works under fish, bash, and zsh.
+The Quickstart commands are the happy path. This section is the deeper reference.
 
 ### Prerequisites
 
-- **`uv`** — Python package/venv manager. [Install](https://docs.astral.sh/uv/getting-started/installation/). uv auto-fetches Python 3.12 if it isn't already on the system.
-- **Claude Code CLI** — needed by `claude mcp add` to register the server. [Install](https://docs.claude.com/en/docs/claude-code/setup). If you only intend to drive the brain from the CLI (not Claude Code), you can skip this and ignore the MCP-register step.
-- **HuggingFace Hub reachable on first ingest.** The embedding model (`sentence-transformers/all-MiniLM-L6-v2`, ~80 MB) auto-downloads from `huggingface.co` into `~/.cache/huggingface/` the first time `get_collection()` runs. Strict-firewall environments need either a one-time online run or a local mirror; subsequent runs are fully offline.
-- **Chromium system libs (Linux, only for `--browser` mode).** `bootstrap.sh` runs `playwright install chromium` which fetches the browser binary, but the underlying system libraries (`nss`, `atk`, `at-spi2-atk`, `cups`, `alsa-lib`, `gtk3`, …) need to be installed separately on non-Debian distros. `playwright install-deps` only knows `apt-get`, so on Arch / Fedora / Void use the native package manager. **Skip this entirely if you'll only ever use the default HTTP fetcher and `--github-docs`.**
+- **`uv`** for Python/venv management. [Install](https://docs.astral.sh/uv/getting-started/installation/). Auto-fetches Python 3.12 if missing.
+- **Claude Code CLI** for `claude mcp add`. [Install](https://docs.claude.com/en/docs/claude-code/setup). Skip if you only want CLI use.
+- **HuggingFace Hub reachable on first ingest.** The embedding model auto-downloads (~80 MB) into `~/.cache/huggingface/`. Subsequent runs are offline.
+- **Chromium system libs (Linux)** only matter for `--browser` mode. `playwright install-deps` only knows `apt-get`, so non-Debian users install via the native package manager. Skip entirely if you'll use HTTP and `--github-docs` only.
 
 ### What `bootstrap.sh` does
 
-`uv venv --python 3.12`, installs `mcp[cli] crawl4ai chromadb langchain-text-splitters sentence-transformers`, then `playwright install chromium` (browser binary only; safe to skip downloading if you'll never use `--browser`). Total disk after first ingest: ~600 MB (venv + Chromium + embedding model).
+`uv venv --python 3.12`, installs `mcp[cli] crawl4ai chromadb langchain-text-splitters sentence-transformers`, then `playwright install chromium`. Total disk after first ingest: ~600 MB.
 
-### Setting env vars (shell quirks)
+### Setting env vars per shell
 
-The two env vars `claude-brain` honors — `LOCALBRAIN_ALLOW_PRIVATE` (bypass the SSRF guard for internal docs) and `GITHUB_TOKEN` (lift `--github-docs` from 60 req/h to 5000 req/h) — set differently per shell.
+`claude-brain` honors `LOCALBRAIN_ALLOW_PRIVATE` (bypass SSRF guard) and `GITHUB_TOKEN` (lift `--github-docs` from 60 to 5000 req/h).
 
-**One-shot, just for one command:**
-```fish
-# fish — use the `env` builtin, since fish doesn't accept VAR=val cmd inline
-env LOCALBRAIN_ALLOW_PRIVATE=1 python ingest.py https://docs.internal/ --brain internal-docs
-env GITHUB_TOKEN=ghp_xxx python ingest.py --github-docs huge/repo --brain huge
-```
-```bash
-# bash / zsh — inline VAR=val prefix works
-LOCALBRAIN_ALLOW_PRIVATE=1 python ingest.py https://docs.internal/ --brain internal-docs
-GITHUB_TOKEN=ghp_xxx python ingest.py --github-docs huge/repo --brain huge
-```
-
-**Persistent, for the whole shell session:**
+One-shot:
 ```fish
 # fish
-set -gx LOCALBRAIN_ALLOW_PRIVATE 1
+env LOCALBRAIN_ALLOW_PRIVATE=1 python ingest.py https://docs.internal/ --brain internal
+```
+```bash
+# bash / zsh
+LOCALBRAIN_ALLOW_PRIVATE=1 python ingest.py https://docs.internal/ --brain internal
+```
+
+Session-wide:
+```fish
+# fish
 set -gx GITHUB_TOKEN ghp_xxx
 ```
 ```bash
 # bash / zsh
-export LOCALBRAIN_ALLOW_PRIVATE=1
 export GITHUB_TOKEN=ghp_xxx
 ```
 
-**Persistent across sessions:** add the `set -gx` (fish) lines to `~/.config/fish/config.fish`, or the `export` (bash/zsh) lines to `~/.bashrc` / `~/.zshrc`.
+Persistent: add the lines to `~/.config/fish/config.fish` or `~/.bashrc` / `~/.zshrc`.
 
----
+## Usage
 
-## How to use it
+### Static docs site (the common case)
 
-### Ingest a static docs site (the common case)
-
-```fish
+```sh
 python ingest.py https://docs.example.com/ \
     --brain example-docs --depth 6 --max-pages 800
 ```
 
-What happens: parallel HTTP BFS rooted at the URL, 16 concurrent fetches per BFS level (`--workers 16` by default), follows same-host links up to 5 hops out (`depth - 1`), capped at 800 pages. Each level batches all new chunks into a single `coll.upsert()` call so the embedding model sees one big tensor instead of N tiny ones. On a typical 1000-page Hugo or MkDocs site this finishes in 3–5 minutes.
+Parallel HTTP BFS, 16 concurrent fetches per level (`--workers 16`), `depth-1` hops out from the root, capped at 800 pages. Each level batches all new chunks into one `coll.upsert()`. A 1000-page Hugo or MkDocs site finishes in 3–5 minutes.
 
-You can pass multiple URLs as roots:
-```fish
+Multiple roots:
+```sh
 python ingest.py https://docs.foo.com/ https://docs.bar.com/ \
     --brain my-stack --depth 4 --max-pages 500
 ```
 
-Filter dead-end URL families with repeatable `--skip` (fnmatch):
-```fish
-python ingest.py https://docs.example.com/ \
-    --brain example-docs --depth 6 --max-pages 800 \
+Skip dead-end URL families (fnmatch, repeatable):
+```sh
+python ingest.py https://docs.example.com/ --brain example-docs \
+    --depth 6 --max-pages 800 \
     --skip '*.yaml' --skip '*/sla/*' --skip '*/_schemas/*'
 ```
 
-### Ingest a JS-rendered docs site
+### JS-rendered docs site
 
-If a fetch returns near-empty markdown but the page renders fine in a browser, the site is JS-rendered. Two options, in order of preference:
+If a fetch returns near-empty markdown but the page renders fine in a browser, the site is JS-rendered. Two options:
 
-**Option A — pull the source repo on GitHub.** Almost every dev-tool docs site (Terraform providers, MkDocs Material projects, Hugo with markdown content) keeps the actual markdown in a public GitHub repo. Bypass HTML entirely:
+**Option A: pull the source repo on GitHub.** Most dev-tool docs sites (Terraform providers, MkDocs Material, Hugo with markdown content) keep the markdown in a public repo:
 
-```fish
+```sh
 python ingest.py --github-docs exoscale/terraform-provider-exoscale \
     --brain terraform-exoscale
 ```
 
-This hits `api.github.com/repos/{repo}/git/trees/{ref}?recursive=1` once to enumerate every `.md` under `docs/`, then fetches each via `raw.githubusercontent.com`. Default branch auto-detected. Append `@REF` (`exoscale/...@v0.65.0`) to pin. Set `GITHUB_TOKEN` for the 5000 req/h authenticated rate limit if you'll be ingesting big repos.
+Hits `api.github.com/repos/{repo}/git/trees/{ref}?recursive=1` once, then fetches each `.md` via `raw.githubusercontent.com`. Default branch auto-detected. Append `@REF` to pin. Set `GITHUB_TOKEN` for higher rate limits.
 
-**Option B — render with Chromium.** Falls back when no GitHub source exists:
-```fish
+**Option B: render with Chromium.** When no public source exists:
+```sh
 python ingest.py https://docs.example.com/ --brain example-docs \
     --depth 4 --max-pages 200 --browser
 ```
-Slower (Chromium per page) and may still under-collect on SPAs that lazy-load content via API after page load.
 
-### Verify completeness
+Slower, and may still under-collect on SPAs that lazy-load via API after initial render.
 
-`sitemap.xml` is the closest thing to ground truth for "what pages exist on this site":
+### Coverage check
 
-```fish
+`sitemap.xml` is the closest thing to ground truth for "what pages exist":
+
+```sh
 python ingest.py --coverage https://docs.example.com/ --brain example-docs
 ```
 
-Output: total sitemap URLs, `stored / failed / missing` breakdown against the brain, first 20 missing URLs. Handles sitemap indexes (recursively follows `<sitemap><loc>`) and `.xml.gz`. `--ingest-missing URL` runs the report and then ingests any sitemap URL not yet in the DB at depth=1.
+Reports total sitemap URLs, `stored / failed / missing` against the brain, plus the first 20 missing. Handles sitemap indexes and `.xml.gz`. `--ingest-missing URL` reports then ingests the gap at depth=1.
 
-### Resume after a kill / fix failures
+### Resume / retry
 
 The manifest persists across runs:
-```fish
+```sh
 python ingest.py --status --brain example-docs       # summary + first 10 failed URLs
-python ingest.py --retry-failed --brain example-docs   # re-fetch every failed/empty URL at depth=1, force=True
+python ingest.py --retry-failed --brain example-docs # re-fetch every failed/empty URL
 ```
 
-Killed crawls don't lose work — chunks upsert per BFS level, so whatever made it in stays. Re-run the same `python ingest.py URL ...` command and skip-known + the BFS link-discovery semantics handle the resume.
+Killed crawls don't lose work. Chunks upsert per BFS level. Re-run the original command and skip-known handles the resume.
 
-### Use the brain from Claude Code
+### Query from Claude Code
 
-Open a fresh session (MCP servers load at session start) and ask in plain language:
-
-> *"Use list_brains to see what's available, then search the example-docs brain for how to configure X. If you need to verify an exact identifier, use grep_brain."*
-
-Claude calls `list_brains`, then `search_knowledge(query="configure X", brain="example-docs")`, then optionally `grep_brain(needle="some-identifier", brain="example-docs")`. Each chunk comes with a `source` URL so answers can be cited.
+Open a fresh session and prompt naturally, e.g. *list_brains, then search the example-docs brain for how to configure X*. Claude calls the tools and answers with citations.
 
 ### Other operations
 
-```fish
-python ingest.py --list                                      # all brains + chunk counts
-python ingest.py --grep 'literal-string' --brain NAME         # paged literal scan
+```sh
+python ingest.py --list                                  # all brains + chunk counts
+python ingest.py --grep 'literal-string' --brain NAME    # paged literal scan
 python ingest.py --grep '[a-z]+-pattern' --regex --brain NAME
-python ingest.py --reset --brain NAME                         # drop a brain
-python ingest.py URL --depth 4 --max-pages 200 --force \
-    --brain NAME                                              # ignore skip-known, re-fetch + overwrite
+python ingest.py --reset --brain NAME                    # drop a brain
+python ingest.py URL --depth 4 --max-pages 200 --force --brain NAME
 ```
-
----
 
 ## CLI reference
 
@@ -284,43 +251,36 @@ ingest.py [URL ...]
 | Flag | Effect |
 |---|---|
 | `URL [URL ...]` | Root URL(s) when `--depth>1`, single pages when `--depth=1`. |
-| `--brain NAME` | Which Chroma collection / manifest to read/write. Default `knowledge`. |
+| `--brain NAME` | Chroma collection / manifest to read/write. Default `knowledge`. |
 | `--depth N` | `1` = single page (default). `2+` = BFS, `N-1` hops out. |
-| `--max-pages M` | Hard cap per root, default 50. Counts fetched pages, not stored. |
-| `--workers N` | Parallel fetches per BFS level via `MemoryAdaptiveDispatcher(max_session_permit=N)`. Default 16. |
-| `--skip PATTERN` | fnmatch URL pattern dropped from the BFS frontier. Repeatable. |
-| `--browser` | Switch fetcher from `AsyncHTTPCrawlerStrategy` to Chromium via `BrowserConfig`. |
+| `--max-pages M` | Hard cap per root, default 50. Counts fetched, not stored. |
+| `--workers N` | Parallel fetches per BFS level. Default 16. |
+| `--skip PATTERN` | fnmatch URL pattern to drop from the BFS. Repeatable. |
+| `--browser` | Use Chromium instead of `AsyncHTTPCrawlerStrategy`. |
 | `--force` | Ignore skip-known, re-fetch + `_purge_url` + upsert. |
-| `--reset` | Drop the brain's Chroma collection. Combinable with a URL crawl. |
-| `--list` | Print every brain in `chroma_db/` with chunk counts. |
-| `--status` | Manifest summary (cumulative + latest-per-URL status counts; first 10 failed). |
-| `--grep NEEDLE` | Page through every chunk, return windowed excerpts containing `NEEDLE`. |
-| `--regex` | Treat `NEEDLE` as a Python regex. |
+| `--reset` | Drop the brain's collection. Combinable with a URL crawl. |
+| `--list` | Print every brain + chunk counts. |
+| `--status` | Manifest summary. |
+| `--grep NEEDLE [--regex]` | Paged literal/regex scan over all chunks. |
 | `--grep-limit N` | Cap matches printed (default 20). |
-| `--coverage URL` | Diff brain against `sitemap.xml`. URL can be sitemap or site root. |
-| `--ingest-missing URL` | Run `--coverage`, then ingest every sitemap URL not yet in the brain (depth=1). |
-| `--retry-failed` | Re-crawl every URL whose latest manifest entry is `failed` or `empty`. |
-| `--github-docs OWNER/REPO[@REF]` | Enumerate `.md` files via GitHub tree API, fetch each from `raw.githubusercontent.com`. |
-| `--github-docs-path PREFIX` | Path prefix in the repo (default `docs/`; `""` matches all `.md`). |
-
----
+| `--coverage URL` | Diff brain against `sitemap.xml`. |
+| `--ingest-missing URL` | Coverage + ingest the gap. |
+| `--retry-failed` | Re-crawl every URL whose latest entry is failed/empty. |
+| `--github-docs OWNER/REPO[@REF]` | Enumerate `.md` via GitHub tree API, fetch via raw.githubusercontent.com. |
+| `--github-docs-path PREFIX` | Path prefix in the repo (default `docs/`; `""` = all `.md`). |
 
 ## MCP tools
 
-The FastMCP server exposes six tools, each accepting a `brain` parameter (defaults to `knowledge`):
-
 | Tool | Signature | Purpose |
 |---|---|---|
-| `list_brains` | `() → str` | Enumerate brains + chunk counts. Use first when unsure which brain holds the topic. |
-| `search_knowledge` | `(query, k=5, brain)` | Vector cosine search. Returns top-k chunks with `[source: url]` headers. |
-| `grep_brain` | `(needle, brain, regex=False, limit=20)` | Literal/regex scan across all chunks. Deterministic existence check. |
-| `learn_url` | `(url, force=False, browser=False, brain)` | Single-URL fetch + chunk + embed. |
+| `list_brains` | `() → str` | Brains + chunk counts. |
+| `search_knowledge` | `(query, k=5, brain)` | Vector cosine search. |
+| `grep_brain` | `(needle, brain, regex=False, limit=20)` | Literal/regex scan. Deterministic existence check. |
+| `learn_url` | `(url, force=False, browser=False, brain)` | Single-URL ingest. |
 | `learn_site` | `(url, depth=2, max_pages=30, workers=16, force=False, browser=False, skip=None, brain)` | BFS-crawl a site. |
-| `learn_github_docs` | `(repo, brain, path_prefix="docs/", ref="", force=False)` | Pull `.md` files from a GitHub repo. |
+| `learn_github_docs` | `(repo, brain, path_prefix="docs/", ref="", force=False)` | Pull `.md` from a GitHub repo. |
 
-`search_knowledge` and `grep_brain` are intentionally redundant. Vector search is fast and good for "approximately about X"; grep is the only honest answer to "is this exact string in here?" Use them together when an LLM needs to commit to verbatim identifiers.
-
----
+`search_knowledge` and `grep_brain` are intentionally redundant. Vector search is fast and good for "approximately about X". Grep is the only honest answer to "is this exact string present?".
 
 ## Internals
 
@@ -328,121 +288,116 @@ The FastMCP server exposes six tools, each accepting a `brain` parameter (defaul
 URLs / GitHub repo
         │
         ▼
- ┌───────────────────────────────────────────┐
- │ Fetcher                                   │
- │   AsyncHTTPCrawlerStrategy   (default)    │  parallel via MemoryAdaptiveDispatcher
- │   AsyncWebCrawler + Chromium (--browser)  │  serial through Playwright
- │   raw.githubusercontent.com  (--github-…) │  urllib direct
- │     ↑ all paths via _check_url_safe       │  scheme + DNS + ipaddress.is_private guard
- └───────────────────────────────────────────┘
+ ┌─────────────────────────────────────────┐
+ │ Fetcher                                 │
+ │   AsyncHTTPCrawlerStrategy   (default)  │  parallel via MemoryAdaptiveDispatcher
+ │   AsyncWebCrawler + Chromium (--browser)│  serial through Playwright
+ │   raw.githubusercontent.com  (--github-)│  urllib direct
+ │   _check_url_safe gate on every path    │  scheme + DNS + ipaddress.is_private
+ └─────────────────────────────────────────┘
         │ HTML, or markdown verbatim
         ▼
- ┌───────────────────────────────────────────┐
- │ DefaultMarkdownGenerator                  │
- │   + PruningContentFilter                  │  threshold 0.48 fixed → fit_markdown
- │     (skipped for --github-docs:           │  source is already markdown)
- │      raw markdown goes through unchanged) │
- └───────────────────────────────────────────┘
+ ┌─────────────────────────────────────────┐
+ │ DefaultMarkdownGenerator                │
+ │   + PruningContentFilter (0.48 fixed)   │  → fit_markdown
+ │   (skipped for --github-docs)           │  source is already markdown
+ └─────────────────────────────────────────┘
         │ clean markdown
         ▼
- ┌───────────────────────────────────────────┐
- │ RecursiveCharacterTextSplitter            │  chunk_size=1000, overlap=100
- └───────────────────────────────────────────┘
+ ┌─────────────────────────────────────────┐
+ │ RecursiveCharacterTextSplitter          │  chunk_size=1000, overlap=100
+ └─────────────────────────────────────────┘
         │ list[chunk]
         ▼
- ┌───────────────────────────────────────────┐
- │ SentenceTransformerEmbeddingFunction      │  all-MiniLM-L6-v2, 384-dim, CPU
- │   batched per BFS level                   │  one upsert per level, not per page
- └───────────────────────────────────────────┘
-        │ list[(id=sha1(url#i), text, embedding, {source, chunk})]
+ ┌─────────────────────────────────────────┐
+ │ SentenceTransformerEmbeddingFunction    │  all-MiniLM-L6-v2, 384-dim, CPU
+ │   batched per BFS level                 │  one upsert per level
+ └─────────────────────────────────────────┘
+        │ list[(id=sha1(url#i), text, embedding, meta)]
         ▼
- ┌───────────────────────────────────────────┐
- │ ChromaDB PersistentClient                 │  ./chroma_db/ (SQLite + parquet blobs)
- │   one collection per brain                │  knowledge, terraform-exoscale, …
- │   functools.lru_cache singleton           │  one open SQLite per process
- └───────────────────────────────────────────┘
+ ┌─────────────────────────────────────────┐
+ │ ChromaDB PersistentClient               │  ./chroma_db/  (SQLite + parquet)
+ │   one collection per brain              │
+ │   functools.lru_cache singleton         │  one open SQLite per process
+ └─────────────────────────────────────────┘
         ▲
         │ similarity_search / .get / .query
         │
- ┌───────────────────────────────────────────┐
- │ FastMCP server (server.py)                │  stdio transport, six tools
- └───────────────────────────────────────────┘
+ ┌─────────────────────────────────────────┐
+ │ FastMCP server (server.py)              │  stdio, six tools
+ └─────────────────────────────────────────┘
         ▲
         │
    Claude Code (or any MCP client)
 ```
 
-### BFS specifics
+### BFS
 
-The web-crawl path uses our own level-by-level BFS instead of `BFSDeepCrawlStrategy` so we can push each level through `arun_many` + `MemoryAdaptiveDispatcher(max_session_permit=workers)`. Per level:
+Custom level-by-level BFS instead of `BFSDeepCrawlStrategy`, so each level pushes through `arun_many` + `MemoryAdaptiveDispatcher(max_session_permit=workers)`. Per level:
 
-1. Filter the frontier: drop URLs in `visited`, drop URLs matching any `--skip` fnmatch pattern.
-2. At the **leaf** level (`level == depth - 1`) also drop URLs already in the brain's `known_sources` (no fetch, no embed).
-3. At **intermediate** levels keep known URLs in the wave anyway — we re-fetch them solely for link discovery, but `_clean_markdown` + `_prepare_chunks` short-circuit when `force is False and norm in known`, so embedding never runs on already-stored content.
+1. Filter the frontier: drop visited URLs and `--skip` matches.
+2. Leaf level (`level == depth - 1`): also drop URLs already in `known_sources`. No fetch, no embed.
+3. Intermediate levels: keep known URLs in the wave for link discovery; embedding is gated on `force or norm not in known` so we never re-embed stored content.
 4. `arun_many` parallel-fetches the wave.
-5. For each result, accumulate `_prepare_chunks` output into a level-wide `pending` list.
-6. After all results, `_bulk_upsert` runs the entire `pending` list through the embedder in 256-chunk batches with progress prints. One torch graph setup per level instead of per page.
-7. Internal links (same-host, http(s) only) get appended to `next_frontier` after dedup against `visited` and `seen_in_next`.
+5. Per result, accumulate `_prepare_chunks` output into a level-wide `pending`.
+6. After the wave, `_bulk_upsert` runs `pending` through the embedder in 256-chunk batches with progress prints. One torch graph per level instead of per page.
+7. Internal links (same host, http/s) get appended to `next_frontier` after dedup.
 
 ### Chroma client lifetime
 
-`get_collection(brain)` is `@functools.lru_cache(maxsize=None)` on the brain name. `_client()` and `_embed_fn()` are `lru_cache(maxsize=1)`. One `PersistentClient` (one open SQLite handle) and one embedding model (one ~80 MB tensor in RAM) per process, regardless of how many MCP queries arrive. First call: ~3 s to load the model. Every subsequent call: cache hit, microseconds.
+`get_collection(brain)` is `@functools.lru_cache(maxsize=None)`. `_client()` and `_embed_fn()` are `lru_cache(maxsize=1)`. One `PersistentClient` and one embedding model per process. First call ~3 s (model load), every subsequent call cache-hits.
 
-### Manifest semantics
+### Manifest
 
-Each ingest attempt writes one JSON line to `crawl_log.<brain>.jsonl`:
 ```json
 {"url":"…","status":"stored","chunks":7,"ts":"2026-05-09T09:00:55+00:00"}
 {"url":"…","status":"failed","error":"HTTP 404 at …","ts":"…"}
-{"url":"…","status":"empty","reason":"no content after pruning filter","ts":"…"}
+{"url":"…","status":"empty","reason":"no content after pruning","ts":"…"}
 ```
-The manifest is append-only. `--status` and `--retry-failed` reduce by latest-per-URL: `_latest_per_url` keeps only the most recent entry for each URL, so a URL that was `failed` then later `stored` shows as `stored`. `--retry-failed` collects URLs whose latest is `failed` or `empty` and re-runs them with `--depth 1 --force`.
 
-### Skip-known correctness across runs
+Append-only. `--status` and `--retry-failed` reduce by latest-per-URL via `_latest_per_url`, so a `failed → stored` URL shows as `stored`.
 
-The BFS reachability gotcha: if a URL is skipped at level N-1, the BFS never sees its outgoing links, so children only reachable through it never get discovered. We accept this trade-off — skip-known prevents redundant network *and* embedding cost on resume, at the price of not re-exploring known subtrees. To force full re-exploration use `--force`.
+### Skip-known reachability
 
-### `coll.get()` paging
+If a URL is skipped at level N-1, the BFS never reads its outgoing links, so children only reachable through it stay undiscovered. Trade-off for fast resumes. Use `--force` to re-explore.
 
-ChromaDB's unfiltered `get()` builds a SQL query that hits SQLite's bind-variable cap (~999) once a collection grows past ~10k records. `known_sources()` and `grep_brain()` page through with explicit `limit=1000` + `offset`, breaking when fewer than `page_size` rows come back.
+### Paged `coll.get()`
 
-### URL safety boundary
+ChromaDB's unfiltered `get()` builds a SQL query that hits SQLite's bind-variable cap (~999) past ~10k records. `known_sources()` and `grep_brain()` page with `limit=1000` + `offset`.
 
-`_check_url_safe(url)` runs at every ingest entrypoint:
-- Reject non-http(s) schemes (catches `file://`, `gopher://`, etc.).
-- `socket.getaddrinfo` the host, then `ipaddress.ip_address(addr)` each result.
+### URL safety
+
+`_check_url_safe(url)`:
+- Reject non-http(s) schemes.
+- `socket.getaddrinfo` the host, then `ipaddress.ip_address(addr)` per result.
 - Reject if any address is `is_private`, `is_loopback`, `is_link_local`, or `is_reserved` (catches RFC1918, `127.0.0.0/8`, `169.254.0.0/16`, IPv6 equivalents).
-- `LOCALBRAIN_ALLOW_PRIVATE=1` env var bypasses for legitimate internal-docs use cases.
+- `LOCALBRAIN_ALLOW_PRIVATE=1` bypasses for internal docs.
 
 ### Embedding model coupling
 
-Embeddings encode which model produced them — vectors from one model can't be queried with another. `EMBED_MODEL` is fixed at module level. Mixing models within a single brain is impossible because Chroma applies the configured embedding function uniformly. Different brains can in principle use different models, but you'd have to fork `EMBED_MODEL` per brain. Out of scope today; for English docs `all-MiniLM-L6-v2` is a sensible default (384 dims, ~80 MB, fast).
+Embeddings encode which model produced them. `EMBED_MODEL` is fixed at module level. Different brains can in principle use different models, but you'd fork `EMBED_MODEL` per brain. `all-MiniLM-L6-v2` is a sensible default for English docs.
 
----
+## Limitations
 
-## Limitations / non-goals
-
-- **CPU-only embedding by default.** torch wheel is the CPU build; ~100 chunks/s on a modern laptop. Sufficient for ~tens-of-thousands-of-chunks corpora. For larger workloads, install a CUDA/ROCm torch and `sentence-transformers` will pick it up automatically — not worth the setup tax for typical use.
-- **No cross-encoder re-ranker.** Top-k from cosine similarity goes straight to the MCP client. Adding a re-ranker would help long-tail queries; not implemented.
-- **No auth / multi-user.** Single developer, single machine. Chroma supports server mode if you want shared access; out of scope here.
-- **English-tuned embeddings.** `all-MiniLM-L6-v2` was trained mostly on English. For non-English docs, swap in `paraphrase-multilingual-MiniLM-L12-v2` and re-ingest.
-- **No automatic re-crawl on doc updates.** Manual: re-run the same `python ingest.py URL ...`; skip-known short-circuits the unchanged pages, `--force` overrides for pages you know changed.
-- **BFS link discovery depends on `<a href>` in static HTML.** SPAs without server-rendered links require `--browser` or `--github-docs`.
-
----
+- CPU-only embedding. ~100 chunks/s on a modern laptop. Install a CUDA/ROCm torch and sentence-transformers picks it up automatically.
+- No cross-encoder re-ranker.
+- No auth or multi-user. Run Chroma in server mode if you want shared access.
+- English-tuned embeddings. Swap `paraphrase-multilingual-MiniLM-L12-v2` and re-ingest for other languages.
+- No automatic re-crawl on doc updates. Re-run `python ingest.py URL ...`; skip-known short-circuits unchanged pages, `--force` overrides.
+- BFS depends on `<a href>` in static HTML. SPAs need `--browser` or `--github-docs`.
 
 ## Repo layout
 
 ```
 claude-brain/
-├── ingest.py                      # CLI + ingest pipeline + helpers
-├── server.py                      # FastMCP server (thin wrappers around ingest.py)
-├── bootstrap.sh                   # one-shot uv-based setup
+├── ingest.py                # CLI + ingest pipeline + helpers
+├── server.py                # FastMCP server
+├── bootstrap.sh             # one-shot uv-based setup
 ├── README.md
-├── LICENSE                        # MIT
-├── .gitignore                     # ignores chroma_db/, manifests, .venv, settings.local.json
-├── chroma_db/                     # generated, gitignored — vector store (many collections)
-└── crawl_log.<brain>.jsonl        # generated, gitignored — append-only manifest per brain
+├── LICENSE                  # MIT
+├── .gitignore               # ignores chroma_db/, manifests, .venv, settings.local.json
+├── chroma_db/               # generated, gitignored: vector store
+└── crawl_log.<brain>.jsonl  # generated, gitignored: append-only manifest per brain
 ```
 
 ## License
