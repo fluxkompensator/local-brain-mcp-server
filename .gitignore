@@ -1,0 +1,20 @@
+# Generated state — these can grow into hundreds of MB
+chroma_db/
+crawl_log.*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual envs (uv defaults to .venv; legacy venv/ also covered)
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
