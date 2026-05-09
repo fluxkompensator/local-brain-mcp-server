@@ -4,12 +4,12 @@ Created: 2026-05-09
 Author:  void
 Purpose: Top-level project overview, install + usage how-to,
          and a technical description of the ingest pipeline,
-         storage layout, and MCP surface for the claude-brain
+         storage layout, and MCP surface for the local-brain
          tool.
 =============================================================
 -->
 
-# claude-brain
+# local-brain
 
 ```
 .-. .-')  _  .-')     ('-.                  .-') _
@@ -73,8 +73,8 @@ Plus the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/setup) fo
 Clone and bootstrap:
 
 ```sh
-git clone https://github.com/<you>/claude-brain.git
-cd claude-brain
+git clone https://github.com/<you>/local-brain.git
+cd local-brain
 ./bootstrap.sh
 ```
 
@@ -131,7 +131,7 @@ The Quickstart commands are the happy path. This section is the deeper reference
 
 ### Setting env vars per shell
 
-`claude-brain` honors `LOCALBRAIN_ALLOW_PRIVATE` (bypass SSRF guard) and `GITHUB_TOKEN` (lift `--github-docs` from 60 to 5000 req/h).
+`local-brain` honors `LOCALBRAIN_ALLOW_PRIVATE` (bypass SSRF guard) and `GITHUB_TOKEN` (lift `--github-docs` from 60 to 5000 req/h).
 
 One-shot:
 ```fish
@@ -389,7 +389,7 @@ Embeddings encode which model produced them. `EMBED_MODEL` is fixed at module le
 ## Repo layout
 
 ```
-claude-brain/
+local-brain/
 ├── ingest.py                # CLI + ingest pipeline + helpers
 ├── server.py                # FastMCP server
 ├── bootstrap.sh             # one-shot uv-based setup
