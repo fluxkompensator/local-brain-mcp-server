@@ -25,6 +25,85 @@ Purpose: Top-level project overview, install + usage how-to,
 
 A local CLI + MCP server that turns web docs and GitHub repos into searchable vector knowledge bases ("brains") for Claude Code or any other MCP client. ~1150 LoC of Python. **Everything runs on your machine** — fetcher, embedding model, vector store, MCP server. No SaaS, no API keys (one optional GitHub token for high-volume crawls), no Docker, no GPU. One `bootstrap.sh` from a fresh clone to a working setup.
 
+## Contents
+
+- [Quickstart](#quickstart) — clone → bootstrap → first crawl
+- [What this does](#what-this-does) — 30-second technical summary of the pipeline
+- [Why local-first, with minimum effort](#why-local-first-with-minimum-effort)
+- [Install](#install) — [Prerequisites](#prerequisites) · [Env vars per shell](#setting-env-vars-shell-quirks)
+- [How to use it](#how-to-use-it) — static sites · SPA / GitHub source · coverage · resume · query
+- [CLI reference](#cli-reference)
+- [MCP tools](#mcp-tools)
+- [Internals](#internals) — deep technical reference
+- [Limitations / non-goals](#limitations--non-goals)
+- [Repo layout](#repo-layout)
+- [License](#license)
+
+---
+
+## Quickstart
+
+Install system prereqs (pick your distro), then a one-shot bootstrap.
+
+<details>
+<summary><strong>Debian / Ubuntu / Mint / PopOS</strong></summary>
+
+```bash
+sudo apt update && sudo apt install -y git curl
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Optional — only if you'll use --browser mode (Chromium):
+sudo apt install -y libnss3 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
+                    libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
+                    libpango-1.0-0 libcairo2 libasound2 libgtk-3-0
+```
+</details>
+
+<details>
+<summary><strong>Arch / CachyOS / Manjaro / EndeavourOS</strong></summary>
+
+```bash
+sudo pacman -S --needed git curl
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Optional — only if you'll use --browser mode (Chromium):
+paru -S --needed nss atk at-spi2-atk libcups alsa-lib gtk3
+```
+</details>
+
+Plus the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/setup) — only needed for MCP registration. Skip if you'll only drive the brain from the CLI.
+
+Then clone, bootstrap, and crawl:
+
+```sh
+git clone https://github.com/<you>/claude-brain.git
+cd claude-brain
+./bootstrap.sh
+```
+
+Activate the venv (one of these):
+
+| Shell | Command |
+|---|---|
+| **fish** | `source .venv/bin/activate.fish` |
+| **bash** | `source .venv/bin/activate` |
+| **zsh** | `source .venv/bin/activate` |
+
+Register the MCP server and run your first crawl:
+
+```sh
+claude mcp add localbrain --scope user -- "$PWD/.venv/bin/python" "$PWD/server.py"
+python ingest.py https://docs.example.com/ --brain example-docs --depth 6 --max-pages 800
+```
+
+Open a fresh Claude Code session and ask:
+
+> *"Use search_knowledge against the example-docs brain to find how to configure X."*
+
+Done — Claude calls the MCP tool, gets chunks with source URLs, answers grounded in the docs you indexed.
+
+For env-var syntax (`LOCALBRAIN_ALLOW_PRIVATE`, `GITHUB_TOKEN`) per shell, see [Setting env vars](#setting-env-vars-shell-quirks). For everything else, read on.
+
 ---
 
 ## What this does
@@ -56,56 +135,20 @@ For each query (from Claude Code or any MCP client):
 
 ## Install
 
-Tested on Linux, Python 3.12. macOS should work. Works under fish, bash, and zsh — see the activate-script note below.
+Read this if you want the deeper rationale behind each prereq or you need shell-specific env-var syntax. The actual commands live in [Quickstart](#quickstart).
+
+Tested on Linux, Python 3.12. macOS should work. Works under fish, bash, and zsh.
 
 ### Prerequisites
 
 - **`uv`** — Python package/venv manager. [Install](https://docs.astral.sh/uv/getting-started/installation/). uv auto-fetches Python 3.12 if it isn't already on the system.
 - **Claude Code CLI** — needed by `claude mcp add` to register the server. [Install](https://docs.claude.com/en/docs/claude-code/setup). If you only intend to drive the brain from the CLI (not Claude Code), you can skip this and ignore the MCP-register step.
 - **HuggingFace Hub reachable on first ingest.** The embedding model (`sentence-transformers/all-MiniLM-L6-v2`, ~80 MB) auto-downloads from `huggingface.co` into `~/.cache/huggingface/` the first time `get_collection()` runs. Strict-firewall environments need either a one-time online run or a local mirror; subsequent runs are fully offline.
-- **Chromium system libs (Linux, only for `--browser` mode).** `bootstrap.sh` runs `playwright install chromium` which fetches the browser binary, but the underlying system libraries (`nss`, `atk`, `at-spi2-atk`, `cups`, `alsa-lib`, `gtk3`, …) need to be installed separately on non-Debian distros. `playwright install-deps` only knows `apt-get`, so on Arch / Fedora / Void use the native package manager. Arch example: `paru -S nss atk at-spi2-atk libcups alsa-lib gtk3`. **You can skip this entirely if you'll only ever use the default HTTP fetcher and `--github-docs`.**
+- **Chromium system libs (Linux, only for `--browser` mode).** `bootstrap.sh` runs `playwright install chromium` which fetches the browser binary, but the underlying system libraries (`nss`, `atk`, `at-spi2-atk`, `cups`, `alsa-lib`, `gtk3`, …) need to be installed separately on non-Debian distros. `playwright install-deps` only knows `apt-get`, so on Arch / Fedora / Void use the native package manager. **Skip this entirely if you'll only ever use the default HTTP fetcher and `--github-docs`.**
 
-```sh
-git clone https://github.com/<you>/claude-brain.git
-cd claude-brain
-./bootstrap.sh           # uv venv + deps + chromium
-```
+### What `bootstrap.sh` does
 
-Activate the venv for the shell you're using:
-
-```fish
-# fish
-source .venv/bin/activate.fish
-```
-```bash
-# bash
-source .venv/bin/activate
-```
-```zsh
-# zsh
-source .venv/bin/activate
-```
-
-Register the MCP server with Claude Code (user scope, one-time):
-
-```fish
-# fish — $PWD works as-is
-claude mcp add localbrain --scope user -- \
-    $PWD/.venv/bin/python $PWD/server.py
-```
-```bash
-# bash / zsh — same idea, double-quote $PWD if your path has spaces
-claude mcp add localbrain --scope user -- \
-    "$PWD/.venv/bin/python" "$PWD/server.py"
-```
-
-`bootstrap.sh` runs `uv venv --python 3.12`, installs `mcp[cli] crawl4ai chromadb langchain-text-splitters sentence-transformers`, then `playwright install chromium` (only used by `--browser`; safe to skip if you'll never use that mode). Total disk: ~600 MB for the venv + Chromium + the embedding model on first ingest.
-
-Verify (works in all three shells):
-```sh
-claude mcp list | grep localbrain     # → ✓ Connected
-python ingest.py --list                 # empty until you crawl something
-```
+`uv venv --python 3.12`, installs `mcp[cli] crawl4ai chromadb langchain-text-splitters sentence-transformers`, then `playwright install chromium` (browser binary only; safe to skip downloading if you'll never use `--browser`). Total disk after first ingest: ~600 MB (venv + Chromium + embedding model).
 
 ### Setting env vars (shell quirks)
 
@@ -398,8 +441,8 @@ claude-brain/
 ├── README.md
 ├── LICENSE                        # MIT
 ├── .gitignore                     # ignores chroma_db/, manifests, .venv, settings.local.json
-├── chroma_db/                     # generated: vector store (one dir, many collections)
-└── crawl_log.<brain>.jsonl        # generated: append-only manifest per brain
+├── chroma_db/                     # generated, gitignored — vector store (many collections)
+└── crawl_log.<brain>.jsonl        # generated, gitignored — append-only manifest per brain
 ```
 
 ## License
