@@ -48,6 +48,7 @@ BRAIN_DEFAULT = "knowledge"
 
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 LocalBrain/1.0"
@@ -64,6 +65,15 @@ def _embed_fn():
     return embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBED_MODEL
     )
+
+
+@functools.lru_cache(maxsize=1)
+def _reranker():
+    """Lazily load the cross-encoder reranker (one-time model download on
+    first use, then cached on disk and in-process)."""
+    from sentence_transformers import CrossEncoder
+
+    return CrossEncoder(RERANK_MODEL)
 
 
 @functools.lru_cache(maxsize=None)
@@ -163,6 +173,158 @@ def grep_brain(
         if len(docs) < page_size:
             break
         offset += page_size
+    return out
+
+
+try:
+    from rank_bm25 import BM25Okapi
+
+    _HAS_BM25 = True
+except ImportError:  # keyword leg is optional; degrade to vector-only
+    _HAS_BM25 = False
+
+_TOKEN_RE = re.compile(r"\w+")
+
+# Per-brain BM25 index, cached in-process so back-to-back searches don't
+# re-tokenize the whole corpus. Keyed by brain → (count, ids, docs, metas, bm25);
+# rebuilt whenever the collection's chunk count changes.
+_BM25_CACHE: dict[str, tuple] = {}
+
+
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_RE.findall((text or "").lower())
+
+
+def _load_corpus(coll, page_size: int = 1000) -> tuple[list[str], list[str], list[dict]]:
+    """Page the whole collection out as (ids, docs, metas), dodging SQLite's
+    bind-variable cap the same way known_sources/grep_brain do."""
+    ids: list[str] = []
+    docs: list[str] = []
+    metas: list[dict] = []
+    offset = 0
+    while True:
+        page = coll.get(include=["documents", "metadatas"], limit=page_size, offset=offset)
+        pids = page.get("ids") or []
+        if not pids:
+            break
+        ids.extend(pids)
+        docs.extend(page.get("documents") or [])
+        metas.extend(page.get("metadatas") or [])
+        if len(pids) < page_size:
+            break
+        offset += page_size
+    return ids, docs, metas
+
+
+def _get_bm25(coll, brain: str):
+    """Return (ids, docs, metas, bm25) for `brain`, rebuilding the BM25 index
+    only when the chunk count has changed. bm25 is None if rank-bm25 isn't
+    installed or the brain is empty."""
+    count = coll.count()
+    cached = _BM25_CACHE.get(brain)
+    if cached and cached[0] == count:
+        return cached[1:]
+    ids, docs, metas = _load_corpus(coll)
+    bm25 = BM25Okapi([_tokenize(d) for d in docs]) if (ids and _HAS_BM25) else None
+    _BM25_CACHE[brain] = (count, ids, docs, metas, bm25)
+    return ids, docs, metas, bm25
+
+
+def hybrid_search(
+    query: str,
+    brain: str = BRAIN_DEFAULT,
+    k: int = 5,
+    candidates: int = 0,
+    rrf_k: int = 60,
+    rerank: bool = True,
+    rerank_pool: int = 0,
+) -> list[dict]:
+    """Hybrid retrieval: fuse dense vector similarity with BM25 keyword
+    ranking via Reciprocal Rank Fusion, then optionally rerank with a
+    cross-encoder.
+
+    Vector search returns semantically-near chunks even when the exact term
+    is absent; BM25 nails exact identifiers (operation IDs, CLI verbs) but
+    misses paraphrase. RRF blends the two ranked lists so a chunk strong on
+    either signal surfaces, and one strong on both ranks highest — without
+    having to reconcile the two scores' different scales. RRF is a recall
+    move: it gets the right chunks into the pool but only knows ranks, not
+    relevance. The cross-encoder then reads each (query, chunk) pair jointly
+    and reorders the pool by true relevance — the precision move.
+
+    Each leg pulls a candidate pool of `candidates` (default max(k*4, 20))
+    and fuses by chunk id with score = Σ 1/(rrf_k + rank). When `rerank` is
+    on, the fused top `rerank_pool` (default max(k*3, 15)) are scored by the
+    cross-encoder and the top k by that score are returned; otherwise the
+    fused top k are returned directly.
+
+    Returns up to k dicts: {id, document, source, score, vrank, brank,
+    rerank_score}. vrank/brank are 1-based ranks within each leg (None when
+    that leg didn't surface the chunk); rerank_score is the cross-encoder
+    logit (None when reranking was off or unavailable). Degrades gracefully
+    to RRF order if rank-bm25 or the reranker model is missing.
+    """
+    coll = get_collection(brain)
+    ids_all, docs_all, metas_all, bm25 = _get_bm25(coll, brain)
+    if not ids_all:
+        return []
+    pool = candidates if candidates > 0 else max(k * 4, 20)
+    pool = min(pool, len(ids_all))
+
+    vres = coll.query(query_texts=[query], n_results=pool)
+    v_ids = (vres.get("ids") or [[]])[0]
+
+    b_ids: list[str] = []
+    if bm25 is not None:
+        scores = bm25.get_scores(_tokenize(query))
+        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        b_ids = [ids_all[i] for i in ranked[:pool] if scores[i] > 0]
+
+    fused: dict[str, float] = {}
+    vrank: dict[str, int] = {}
+    brank: dict[str, int] = {}
+    for rank, cid in enumerate(v_ids, 1):
+        vrank[cid] = rank
+        fused[cid] = fused.get(cid, 0.0) + 1.0 / (rrf_k + rank)
+    for rank, cid in enumerate(b_ids, 1):
+        brank[cid] = rank
+        fused[cid] = fused.get(cid, 0.0) + 1.0 / (rrf_k + rank)
+
+    idx = {cid: i for i, cid in enumerate(ids_all)}
+    ranked_ids = sorted(fused, key=lambda c: fused[c], reverse=True)
+
+    # Cross-encoder rerank: read the fused top pool jointly with the query
+    # and reorder by true relevance. Falls back to RRF order if the model
+    # can't load (offline first run, missing dep, etc.).
+    rerank_score: dict[str, float] = {}
+    if rerank and ranked_ids:
+        pool_n = rerank_pool if rerank_pool > 0 else max(k * 3, 15)
+        cand = ranked_ids[:pool_n]
+        try:
+            pairs = [(query, docs_all[idx[c]]) for c in cand]
+            scores = _reranker().predict(pairs)
+            rerank_score = {c: float(s) for c, s in zip(cand, scores)}
+            ranked_ids = sorted(cand, key=lambda c: rerank_score[c], reverse=True)
+        except Exception as e:  # never let reranking break retrieval
+            print(f"  (reranker unavailable, using RRF order: {e})", file=sys.stderr)
+
+    out: list[dict] = []
+    for cid in ranked_ids[:k]:
+        i = idx.get(cid)
+        if i is None:
+            continue
+        rs = rerank_score.get(cid)
+        out.append(
+            {
+                "id": cid,
+                "document": docs_all[i],
+                "source": (metas_all[i] or {}).get("source", "?"),
+                "score": round(fused[cid], 6),
+                "vrank": vrank.get(cid),
+                "brank": brank.get(cid),
+                "rerank_score": round(rs, 4) if rs is not None else None,
+            }
+        )
     return out
 
 

@@ -12,8 +12,8 @@ from mcp.server.fastmcp import FastMCP
 
 from ingest import (
     BRAIN_DEFAULT,
-    get_collection,
     grep_brain as _grep_brain,
+    hybrid_search,
     ingest,
     ingest_github_docs,
     list_brains as _list_brains,
@@ -70,7 +70,17 @@ def grep_brain(
 
 @mcp.tool()
 def search_knowledge(query: str, k: int = 5, brain: str = BRAIN_DEFAULT) -> str:
-    """Search a brain (vector store) for chunks relevant to the query.
+    """Search a brain for chunks relevant to the query (hybrid + rerank).
+
+    Fuses dense vector similarity with BM25 keyword ranking via Reciprocal
+    Rank Fusion, then reorders the pool with a cross-encoder reranker that
+    reads each (query, chunk) pair jointly. Semantic matches surface
+    paraphrases, BM25 nails exact identifiers (operation IDs, CLI verbs,
+    function names), and the reranker sharpens final ordering by true
+    relevance. Each result is tagged with how it was surfaced — e.g.
+    (vec#2+bm25#1 rr=6.42) means it ranked 2nd by vectors, 1st by keywords,
+    with cross-encoder score 6.42. For a pure literal "does this exact
+    string exist" check, use grep_brain instead.
 
     Args:
         query: Natural-language question or topic to look up.
@@ -79,17 +89,21 @@ def search_knowledge(query: str, k: int = 5, brain: str = BRAIN_DEFAULT) -> str:
             to see what's available (e.g. 'exoscale-community',
             'terraform-exoscale').
     """
-    coll = get_collection(brain)
-    res = coll.query(query_texts=[query], n_results=k)
-    docs = (res.get("documents") or [[]])[0]
-    metas = (res.get("metadatas") or [[]])[0]
-    if not docs:
+    hits = hybrid_search(query, brain=brain, k=k)
+    if not hits:
         return f"No matches in brain '{brain}'."
 
     parts = []
-    for doc, meta in zip(docs, metas):
-        src = (meta or {}).get("source", "?")
-        parts.append(f"[source: {src}]\n{doc}")
+    for h in hits:
+        tags = []
+        if h["vrank"]:
+            tags.append(f"vec#{h['vrank']}")
+        if h["brank"]:
+            tags.append(f"bm25#{h['brank']}")
+        signal = "+".join(tags) or "?"
+        if h.get("rerank_score") is not None:
+            signal += f" rr={h['rerank_score']}"
+        parts.append(f"[source: {h['source']}] ({signal})\n{h['document']}")
     return "\n\n---\n\n".join(parts)
 
 

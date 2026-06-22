@@ -108,8 +108,8 @@ For each ingest:
 
 For each query:
 
-- `search_knowledge(query, k, brain)` runs ChromaDB cosine similarity, returns top-k chunks plus their source URLs.
-- `grep_brain(needle, brain, regex)` is a paged literal/regex scan. Vector search returns near-matches even when a literal isn't present, which is enough for a model to confabulate identifiers; grep gives a deterministic yes/no.
+- `search_knowledge(query, k, brain)` runs hybrid retrieval — dense vector similarity fused with BM25 keyword ranking via Reciprocal Rank Fusion, then reordered by a cross-encoder reranker. Returns top-k chunks plus their source URLs, each tagged with how it surfaced (e.g. `vec#2+bm25#1 rr=6.42`). See [Internals](#internals) for the mechanics.
+- `grep_brain(needle, brain, regex)` is a paged literal/regex scan. Even hybrid search returns near-matches when a literal isn't present, which is enough for a model to confabulate identifiers; grep gives a deterministic yes/no.
 - `learn_url`, `learn_site`, `learn_github_docs`, `list_brains` mirror the CLI as MCP tools.
 
 All URL-accepting entrypoints call `_check_url_safe` first. It rejects non-http(s) schemes and any host that resolves to a private, loopback, or link-local IP. Bypass with `LOCALBRAIN_ALLOW_PRIVATE=1` for legitimate internal docs.
@@ -122,7 +122,7 @@ The Quickstart commands are the happy path. This section is the deeper reference
 
 - **`uv`** for Python/venv management. [Install](https://docs.astral.sh/uv/getting-started/installation/). Auto-fetches Python 3.12 if missing.
 - **Claude Code CLI** for `claude mcp add`. [Install](https://docs.claude.com/en/docs/claude-code/setup). Skip if you only want CLI use.
-- **HuggingFace Hub reachable on first ingest.** The embedding model auto-downloads (~80 MB) into `~/.cache/huggingface/`. Subsequent runs are offline.
+- **HuggingFace Hub reachable on first ingest and first search.** The embedding model auto-downloads (~80 MB) on first ingest and the cross-encoder reranker (~80 MB) on first `search_knowledge`, both into `~/.cache/huggingface/`. Subsequent runs are offline; if the reranker can't be fetched, search falls back to RRF order.
 - **Chromium system libs (Linux)** only matter for `--browser` mode. `playwright install-deps` only knows `apt-get`, so non-Debian users install via the native package manager. Skip entirely if you'll use HTTP and `--github-docs` only.
 
 ### What `bootstrap.sh` does
@@ -274,13 +274,24 @@ ingest.py [URL ...]
 | Tool | Signature | Purpose |
 |---|---|---|
 | `list_brains` | `() → str` | Brains + chunk counts. |
-| `search_knowledge` | `(query, k=5, brain)` | Vector cosine search. |
+| `search_knowledge` | `(query, k=5, brain)` | Hybrid: vector + BM25 (RRF) + cross-encoder rerank. |
 | `grep_brain` | `(needle, brain, regex=False, limit=20)` | Literal/regex scan. Deterministic existence check. |
 | `learn_url` | `(url, force=False, browser=False, brain)` | Single-URL ingest. |
 | `learn_site` | `(url, depth=2, max_pages=30, workers=16, force=False, browser=False, skip=None, brain)` | BFS-crawl a site. |
 | `learn_github_docs` | `(repo, brain, path_prefix="docs/", ref="", force=False)` | Pull `.md` from a GitHub repo. |
 
-`search_knowledge` and `grep_brain` are intentionally redundant. Vector search is fast and good for "approximately about X". Grep is the only honest answer to "is this exact string present?".
+`search_knowledge` and `grep_brain` are intentionally redundant. Hybrid search is good for "approximately about X" and, thanks to the BM25 leg, much better than pure vectors at surfacing chunks that contain an exact identifier. Grep is still the only honest answer to "is this exact string present?" — search ranks, grep proves.
+
+### Hybrid retrieval + rerank
+
+`search_knowledge` runs two retrievers and a reranker:
+
+1. **Dense.** ChromaDB cosine over `all-MiniLM-L6-v2` embeddings — semantic recall, catches paraphrase.
+2. **Sparse.** `rank-bm25` (`BM25Okapi`) over a tokenized copy of the brain — exact-term recall, catches operation IDs / CLI verbs / function names that vectors blur. The BM25 index is built lazily per brain and cached in-process, keyed by chunk count, so it only rebuilds when the brain changes.
+3. **Fuse.** Each leg contributes a candidate pool (`max(k*4, 20)`), fused by chunk ID with Reciprocal Rank Fusion: `score = Σ 1/(60 + rank)`. RRF needs no score-scale reconciliation — a chunk strong on either leg surfaces, one strong on both ranks highest. This is the recall move.
+4. **Rerank.** The fused top `max(k*3, 15)` are scored by the `cross-encoder/ms-marco-MiniLM-L-6-v2` cross-encoder, which reads each `(query, chunk)` pair jointly and reorders by true relevance. This is the precision move. Top `k` by rerank score are returned.
+
+Every leg degrades gracefully: no `rank-bm25` → vector-only; reranker model unavailable (offline first run) → RRF order. Both fall back without raising. Pass `rerank=False` to `hybrid_search` to skip the cross-encoder.
 
 ## Internals
 

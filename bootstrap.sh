@@ -18,7 +18,7 @@ uv venv --python 3.12
 # shellcheck disable=SC1091
 source .venv/bin/activate
 uv pip install "mcp[cli]" crawl4ai chromadb \
-    langchain-text-splitters sentence-transformers
+    langchain-text-splitters sentence-transformers rank-bm25
 playwright install chromium
 
 cat <<'EOF'
